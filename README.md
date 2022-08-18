@@ -3,6 +3,7 @@ DSA sample code for memory proxy testing. Code includes memory fill, move, copy 
 This is sample code which reuses dsa-perf-micros source code snippets to show how DSA offload capability 
 can be tested without changing application code by using LD_PRELOAD option.
 
+```bash
 dsa-memproxy.c: DSA memory operations proxy shared library
 dsa-memproxy-test.c: Sample multi-threaded test sample
 test.sh: Sample test script to test shared and dedicated WQ configs
@@ -13,6 +14,7 @@ Following environment variables control the behavior of DSA proxy operations:
 	USESTDC_CALLS=0 (uses std c memory functions only), 1 (uses DSA calls, in case of failures - reverts to std c lib call)
 	COLLECT_STATS=1 (enables stats collection - #of operations, avg latency for each function>, 0 (disables stats collection)
 	DSA_MIN_BYTES=xxxx (specifies minimum size needed for DSA operation execution, default is 4096 bytes)
+```
 
 ## Build
 
