@@ -109,6 +109,8 @@ atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 
+int dwq_desc_outstanding = 0;
+
 // call initialize/cleanup functions when library is loaded
 static void init_mem_proxy() __attribute__((constructor));
 static void cleanup_mem_proxy() __attribute__((destructor));
@@ -187,12 +189,22 @@ static __always_inline int dsa_execute(void *wq_portal, int dedicated,
 	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 		int retry = 0;
 		*comp = 0;
-		if (dedicated)
-			movdir64b(hw, wq_portal);
-		else
+		if (dedicated) {
+			int old_outstanding = dwq_desc_outstanding;
+			 if (old_outstanding < wq_size &&
+					atomic_compare_exchange_strong(
+					&dwq_desc_outstanding, &old_outstanding,
+					old_outstanding+1))
+				movdir64b(hw, wq_portal);
+			else {
+				retry = 1;
+			}
+		} else {
 			retry = enqcmd(hw, wq_portal);
+		}
 		if (!retry) {
 			dsa_wait_busy_poll(comp);
+			atomic_store(&dwq_desc_outstanding, dwq_desc_outstanding - 1);
 			if (*comp == DSA_COMP_SUCCESS)
 				return SUCCESS;
 			else if ((*comp & 0x7F) == DSA_COMP_PAGE_FAULT_NOBOF)
