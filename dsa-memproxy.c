@@ -21,6 +21,9 @@
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
 
+// DSA capabilities
+#define GENCAP_CC_MEMORY  0x4
+
 #define ENQCMD_MAX_RETRIES 3
 
 #define UMWAIT_DELAY 100000
@@ -432,7 +435,9 @@ static void *dsa_memset(void *s, int c, size_t n, int *result)
 
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_MEMFILL;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_BOF | IDXD_OP_FLAG_RCR;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dsa_gencap & GENCAP_CC_MEMORY)
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr =	(uint64_t) &thr_comp;
 	thr_desc.pattern = memset_pattern;
 	thr_desc.dst_addr = (uint64_t) s;
@@ -446,7 +451,9 @@ static void *dsa_memcpymove(void *dest, const void *src, size_t n, bool is_memcp
 {
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_BOF | IDXD_OP_FLAG_RCR;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
+	if (dsa_gencap & GENCAP_CC_MEMORY)
+		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr =	(uint64_t) &thr_comp;
 	thr_desc.src_addr = (uint64_t) src;
 	thr_desc.dst_addr = (uint64_t) dest;
@@ -460,7 +467,7 @@ static int dsa_memcmp(const void *s1, const void *s2, size_t n, int *result)
 {
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_COMPARE;
-	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_BOF | IDXD_OP_FLAG_RCR;
+	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
 	thr_desc.completion_addr =	(uint64_t) &thr_comp;
 	thr_desc.src_addr = (uint64_t) s1;
 	thr_desc.src2_addr = (uint64_t) s2;
