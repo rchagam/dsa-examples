@@ -12,6 +12,7 @@
 #include <linux/idxd.h>
 #include <x86intrin.h>
 #include <threads.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <execinfo.h>
@@ -104,6 +105,20 @@ static const char* failure_names[] = {
 	[FAIL_OTHERS] = "Others",
 };
 
+enum wait_options {
+	WAIT_BUSYPOLL = 0,
+	WAIT_UMWAIT,
+	WAIT_YIELD
+};
+
+static const char* wait_names[] = {
+	[WAIT_BUSYPOLL] = "busypoll",
+	[WAIT_UMWAIT] = "umwait",
+	[WAIT_YIELD] = "yield",
+};
+
+int wait_method = WAIT_BUSYPOLL;
+
 int collect_stats = 1;
 atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
@@ -175,6 +190,13 @@ static __always_inline inline int umwait(unsigned long timeout, unsigned int sta
 	return r;
 }
 
+static __always_inline void dsa_wait_yield(const volatile uint8_t *comp)
+{
+  while (*comp == 0) {
+      sched_yield();
+  }
+}
+
 static __always_inline void dsa_wait_busy_poll(const volatile uint8_t *comp)
 {
   while (*comp == 0) {
@@ -218,7 +240,13 @@ static __always_inline int dsa_execute(void *wq_portal, int dedicated,
 			retry = enqcmd(hw, wq_portal);
 		}
 		if (!retry) {
-			dsa_wait_busy_poll(comp);
+			if (wait_method == WAIT_YIELD)
+				dsa_wait_yield(comp);
+			else if (wait_method == WAIT_UMWAIT && umwait_support)
+				dsa_wait_umwait(comp);
+			else
+				dsa_wait_busy_poll(comp);
+
 			if (dedicated)
 				atomic_store(&dwq_desc_outstanding, dwq_desc_outstanding - 1);
 			if (*comp == DSA_COMP_SUCCESS)
@@ -452,6 +480,14 @@ static void init_mem_proxy(void)
 		if (env_str != NULL)
 			collect_stats = atoi(env_str);
 
+		env_str = getenv("WAIT_METHOD");
+		if (env_str != NULL) {
+			if (!strncmp(env_str, "yield", 5))
+				wait_method = WAIT_YIELD;
+			else if (!strncmp(env_str, "umwait", 6))
+				wait_method = WAIT_UMWAIT;
+		}
+
 		// initialize DSA 
 		if (!use_std_lib_calls) {
 			memproxy_init();
@@ -466,8 +502,8 @@ static void init_mem_proxy(void)
 				dsa_min_size = atoi(dsa_min_size_str);
 
 			printf("wq_dedicated: %d, wq_size: %d, dsa_cap: %lx, collect_stats: %d, "
-				"use_std_lib_calls: %d, dsa_min_size: %d, wq_path: %s\n",
-			wq_dedicated, wq_size, dsa_gencap, collect_stats, use_std_lib_calls, dsa_min_size, wq_path);
+				"use_std_lib_calls: %d, dsa_min_size: %d, wq_path: %s, wait_method %s\n",
+			wq_dedicated, wq_size, dsa_gencap, collect_stats, use_std_lib_calls, dsa_min_size, wq_path, wait_names[wait_method]);
 		}
 	}
 }
