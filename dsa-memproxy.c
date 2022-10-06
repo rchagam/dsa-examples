@@ -219,7 +219,8 @@ static __always_inline int dsa_execute(void *wq_portal, int dedicated,
 		}
 		if (!retry) {
 			dsa_wait_busy_poll(comp);
-			atomic_store(&dwq_desc_outstanding, dwq_desc_outstanding - 1);
+			if (dedicated)
+				atomic_store(&dwq_desc_outstanding, dwq_desc_outstanding - 1);
 			if (*comp == DSA_COMP_SUCCESS)
 				return SUCCESS;
 			else if ((*comp & 0x7F) == DSA_COMP_PAGE_FAULT_NOBOF)
