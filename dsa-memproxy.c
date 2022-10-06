@@ -78,18 +78,36 @@ enum stat_group {
 	STDC_CALL = 0x0,
 	DSA_CALL_SUCCESS,
 	DSA_CALL_FAILED,
+	DSA_FAIL_CODES,
 	MAX_STAT_GROUP
 };
 
 static const char* stat_group_names[] = {
 	[STDC_CALL] = "stdc calls",
 	[DSA_CALL_SUCCESS] = "dsa (success)",
-	[DSA_CALL_FAILED] = "dsa (failed)"
+	[DSA_CALL_FAILED] = "dsa (failed)",
+	[DSA_FAIL_CODES] = "failure reason"
+};
+
+enum return_code {
+	SUCCESS = 0x0,
+	RETRIES,
+	PAGE_FAULT,
+	FAIL_OTHERS,
+	MAX_FAILURES,
+};
+
+static const char* failure_names[] = {
+	[SUCCESS] = "Success",
+	[RETRIES] = "Retries",
+	[PAGE_FAULT] = "PFs",
+	[FAIL_OTHERS] = "Others",
 };
 
 int collect_stats = 1;
 atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 
 // call initialize/cleanup functions when library is loaded
 static void init_mem_proxy() __attribute__((constructor));
@@ -176,15 +194,19 @@ static __always_inline int dsa_execute(void *wq_portal, int dedicated,
 		if (!retry) {
 			dsa_wait_busy_poll(comp);
 			if (*comp == DSA_COMP_SUCCESS)
-				return 0;	
-			else
-				return 1;
+				return SUCCESS;
+			else if ((*comp & 0x7F) == DSA_COMP_PAGE_FAULT_NOBOF)
+				return PAGE_FAULT;
+			else {
+				printf("failed status %x xfersz %x\n", *comp, hw->xfer_size);
+				return FAIL_OTHERS;
+			}
 		}
 	}
-	return 1;
+	return RETRIES;
 }
 
-static void update_stats(int op, size_t n, uint64_t elapsed_ns, int group)
+static void update_stats(int op, size_t n, uint64_t elapsed_ns, int group, int error_code)
 {
 	if (unlikely(!collect_stats))
 		return;
@@ -193,6 +215,9 @@ static void update_stats(int op, size_t n, uint64_t elapsed_ns, int group)
 		bucket = HIST_NO_BUCKETS-1;
 	++op_counter[bucket][group][op];
 	lat_counter[bucket][group][op] += elapsed_ns;
+	if (group == DSA_CALL_FAILED)
+		++fail_counter[bucket][error_code];
+
 }
 
 static void print_stats()
@@ -212,10 +237,13 @@ static void print_stats()
 		printf("\n");
 
 		printf("%-17s -- ", "Byte Range");
-		for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			for (int o = 0; o < MAX_MEMOP; ++o)
 				printf("%-6s ", memop_names[o]);
 		}
+		if (t == 0)
+			for (int o = 1; o < MAX_FAILURES; ++o)
+				printf("%-6s ", failure_names[o]);
 		printf("\n");
 
 		for (int b = 0; b < HIST_NO_BUCKETS; ++b) {
@@ -236,7 +264,7 @@ static void print_stats()
 				else
 					printf("   >=%-12d -- ", b*4096);
 					
-				for (int g = 0; g < MAX_STAT_GROUP; ++g) {
+				for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 					for (int o = 0; o < MAX_MEMOP; ++o) {
 						if (t == 0) {
 							printf("%-6d ", op_counter[b][g][o]);
@@ -511,12 +539,12 @@ static void *mem_op_internal(int op, void *s1, const void *s2, size_t n, int c)
 			clock_gettime(CLOCK_BOOTTIME, &et);
 
 		if (result) { /* fallback to std c lib call if there is failure */
-			update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, DSA_CALL_FAILED);
+			update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, DSA_CALL_FAILED, result);
 			use_orig_func = 1;
 			result = 0;
 		}
 		else {
-			update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, DSA_CALL_SUCCESS);
+			update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, DSA_CALL_SUCCESS, 0);
 		}
 	}
 
@@ -539,7 +567,7 @@ static void *mem_op_internal(int op, void *s1, const void *s2, size_t n, int c)
 		}
 		if (collect_stats)
 			clock_gettime(CLOCK_REALTIME, &et);
-		update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, STDC_CALL);
+		update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, STDC_CALL, 0);
 	}
 
 	return ret;
