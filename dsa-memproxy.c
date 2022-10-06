@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <execinfo.h>
 #include <dlfcn.h>
+#include <accel-config/libaccel_config.h>
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
@@ -40,9 +41,13 @@ void * (*orig_memmove)(void *dest, const void *src, size_t n) = NULL;
 int (*orig_memcmp)(const void *s1, const void *s2, size_t n) = NULL;
 
 // global workqueue variables
+struct accfg_ctx *memproxy_ctx;
+struct accfg_wq *memproxy_wq;
+uint64_t dsa_gencap;
+int wq_size;
 uint8_t dsa_initialized = 0;
 uint8_t use_std_lib_calls = 0;
-char *wq_path = NULL;
+char wq_path[PATH_MAX];
 int wq_dedicated = 0;
 int wq_fd = 0;
 void *wq_portal = NULL;
@@ -244,10 +249,128 @@ static void print_stats()
 						}
 					}
 				}
+				if (t == 0)
+					for (int o = 1; o < MAX_FAILURES; ++o)
+						printf("%-6d ", fail_counter[b][o]);
 				printf("\n");
 			}
 		}
 	}
+}
+
+void memproxy_init(void)
+{
+        unsigned int unused[2];
+        unsigned int leaf, waitpkg;
+	int dev_id = -1, shared = 1;
+
+        struct accfg_device *device;
+        struct accfg_wq *wq;
+        int rc;
+
+        /* detect umwait support */
+        leaf = 7;
+        waitpkg = 0;
+        cpuid(&leaf, unused, &waitpkg, unused + 1);
+        if (waitpkg & 0x20) {
+                printf("umwait supported\n");
+                umwait_support = 1;
+        }
+
+	memproxy_ctx = NULL;
+	memproxy_wq = NULL;
+
+	rc = accfg_new(&memproxy_ctx);
+	if (rc < 0)
+		return;
+
+again:
+        accfg_device_foreach(memproxy_ctx, device) {
+                enum accfg_device_state dstate;
+
+                /* Make sure that the device is enabled */
+                dstate = accfg_device_get_state(device);
+                if (dstate != ACCFG_DEVICE_ENABLED)
+                        continue;
+
+                /* Match the device to the id requested */
+                if (accfg_device_get_id(device) != dev_id &&
+                    dev_id != -1)
+                        continue;
+
+                accfg_wq_foreach(device, wq) {
+                        enum accfg_wq_state wstate;
+                        enum accfg_wq_mode mode;
+                        enum accfg_wq_type type;
+
+                        /* Get a workqueue that's enabled */
+                        wstate = accfg_wq_get_state(wq);
+                        if (wstate != ACCFG_WQ_ENABLED)
+                                continue;
+
+                        /* The wq type should be user */
+                        type = accfg_wq_get_type(wq);
+                        if (type != ACCFG_WQT_USER)
+                                continue;
+
+                        /* Make sure the mode is correct */
+                        mode = accfg_wq_get_mode(wq);
+                        if ((mode == ACCFG_WQ_SHARED && !shared) ||
+                            (mode == ACCFG_WQ_DEDICATED && shared))
+                                continue;
+
+			if (mode == ACCFG_WQ_SHARED)
+				wq_dedicated = false;
+			else
+				wq_dedicated = true;
+
+			wq_size = accfg_wq_get_size(wq);
+
+                        memproxy_wq = wq;
+			break;
+                }
+		if (memproxy_wq) {
+			dsa_gencap = accfg_device_get_gen_cap(device);
+			break;
+		}
+        }
+
+	// If we can't find an SWQ, try to find a DWQ
+	if (memproxy_wq == NULL && shared == 1) {
+		shared = 0;
+		goto again;
+	}
+
+       if (memproxy_wq == NULL)
+	      goto fail;
+
+        rc = accfg_wq_get_user_dev_path(memproxy_wq, wq_path, PATH_MAX);
+        if (rc) {
+                printf("Error getting device path\n");
+                goto fail;
+        }
+
+	// open DSA WQ
+	wq_fd = open(wq_path, O_RDWR);
+	if (wq_fd < 0) {
+		printf("DSA WQ %s open error: %s\n", wq_path, strerror(errno));
+		goto fail;
+	}
+
+	// map DSA WQ portal
+	wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wq_fd, 0);
+	if (wq_portal == NULL) {
+		printf("mmap error for DSA wq: %s, error: %s\n", wq_path, strerror(errno));
+		close(wq_fd);
+		goto fail;
+	}
+	printf("*** initialized dsa ***\n");
+
+        return;
+
+fail:
+	accfg_unref(memproxy_ctx);
+	memproxy_ctx = NULL;
 }
 
 static void init_mem_proxy(void)
@@ -262,50 +385,31 @@ static void init_mem_proxy(void)
 		orig_memmove = dlsym(RTLD_NEXT, "memmove");
 		orig_memcmp = dlsym(RTLD_NEXT, "memcmp");
 
-		// check environment variables
-		char *wq_type = getenv("WQ_DEDICATED");
-		if (wq_type != NULL)
-			wq_dedicated = atoi(wq_type);
+               char *env_str = getenv("USESTDC_CALLS");
+               if (env_str != NULL)
+                       use_std_lib_calls = atoi(env_str);
 
-		char *env_str = getenv("COLLECT_STATS");
+		env_str = getenv("COLLECT_STATS");
 		if (env_str != NULL)
 			collect_stats = atoi(env_str);
 
-		env_str = getenv("USESTDC_CALLS");
-		if (env_str != NULL)
-			use_std_lib_calls = atoi(env_str);
-
-		char *dsa_min_size_str = getenv("DSA_MIN_BYTES");
-		if (dsa_min_size_str != NULL) 
-			dsa_min_size = atoi(dsa_min_size_str);
-
-		wq_path = getenv("WQ_PATH");
-		if (wq_path == NULL) {
-			printf("WQ_PATH *** not specified ***, using std c lib calls\n");
-			use_std_lib_calls = 1;
-		}
-
-		printf("wq_dedicated: %d, collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %d, wq_path: %s\n",
-			wq_dedicated, collect_stats, use_std_lib_calls, dsa_min_size, wq_path);
-
 		// initialize DSA 
 		if (!use_std_lib_calls) {
-			// open DSA WQ
-			wq_fd = open(wq_path, O_RDWR);
-			if (wq_fd < 0) {
-				printf("DSA WQ %s open error: %s\n", wq_path, strerror(errno));
-				use_std_lib_calls = 1;
-			}
+			memproxy_init();
 
-			// map DSA WQ portal
-			wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wq_fd, 0);
-			if (wq_portal == NULL) {
-				printf("mmap error for DSA wq: %s, error: %s\n", wq_path, strerror(errno));
+			if (memproxy_ctx == NULL) {
 				use_std_lib_calls = 1;
+				return;
 			}
+			// check environment variables
+			char *dsa_min_size_str = getenv("DSA_MIN_BYTES");
+			if (dsa_min_size_str != NULL) 
+				dsa_min_size = atoi(dsa_min_size_str);
+
+			printf("wq_dedicated: %d, wq_size: %d, dsa_cap: %lx, collect_stats: %d, "
+				"use_std_lib_calls: %d, dsa_min_size: %d, wq_path: %s\n",
+			wq_dedicated, wq_size, dsa_gencap, collect_stats, use_std_lib_calls, dsa_min_size, wq_path);
 		}
-
-		printf("*** initialized dsa ***\n");
 	}
 }
 
