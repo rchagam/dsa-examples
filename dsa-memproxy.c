@@ -293,7 +293,7 @@ static void print_stats()
 		if (t == 0)
 			printf("\n******** Number of Memory Operations ********\n");
 		else
-			printf("\n******** Average Memory Operation Latency (ms)  ********\n");
+			printf("\n******** Average Memory Operation Latency (us)  ********\n");
 			
 		printf("%17s    ", "");
 		for (int g = 0; g < MAX_STAT_GROUP; ++g)
@@ -335,8 +335,8 @@ static void print_stats()
 						}
 						else {
 							if (op_counter[b][g][o] != 0) {
-								double avg_ms = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000000.0);
-								printf("%-6.2f ", avg_ms);
+								double avg_us = ((double) lat_counter[b][g][o])/(((double) op_counter[b][g][o]) * 1000.0);
+								printf("%-6.2f ", avg_us);
 							}
 							else {
 								printf("%-6d ", 0);
