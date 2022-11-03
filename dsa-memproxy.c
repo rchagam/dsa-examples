@@ -34,6 +34,8 @@
 #define USE_ORIG_FUNC(n) (use_std_lib_calls == 1 || n < dsa_min_size)
 #define TS_NS(s, e) (((e.tv_sec*1000000000) + e.tv_nsec) - ((s.tv_sec*1000000000) + s.tv_nsec))
 
+#define MAX_WQS 4
+
 // thread specific variables
 __thread struct dsa_hw_desc thr_desc __attribute__ ((aligned (32)));
 __thread struct dsa_completion_record thr_comp __attribute__ ((aligned (32)));
@@ -44,17 +46,25 @@ void * (*orig_memcpy)(void *dest, const void *src, size_t n) = NULL;
 void * (*orig_memmove)(void *dest, const void *src, size_t n) = NULL;
 int (*orig_memcmp)(const void *s1, const void *s2, size_t n) = NULL;
 
+struct memproxy_wq {
+	struct accfg_wq *acc_wq;
+	char wq_path[PATH_MAX];
+	int dedicated;
+	uint64_t dsa_gencap;
+	int wq_size;
+	int wq_fd;
+	void *wq_portal;
+	int dwq_desc_outstanding;
+
+};
+
 // global workqueue variables
 struct accfg_ctx *memproxy_ctx;
-struct accfg_wq *memproxy_wq;
-uint64_t dsa_gencap;
-int wq_size;
+struct memproxy_wq wqs[MAX_WQS];
+uint8_t num_wqs;
+uint8_t next_wq;
 uint8_t dsa_initialized = 0;
 uint8_t use_std_lib_calls = 0;
-char wq_path[PATH_MAX];
-int wq_dedicated = 0;
-int wq_fd = 0;
-void *wq_portal = NULL;
 size_t dsa_min_size = 4096;
 
 enum memop {
@@ -123,8 +133,6 @@ int collect_stats = 1;
 atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
-
-int dwq_desc_outstanding = 0;
 
 // call initialize/cleanup functions when library is loaded
 static void init_mem_proxy() __attribute__((constructor));
@@ -219,25 +227,25 @@ static __always_inline void dsa_wait_umwait(const volatile uint8_t* comp)
     }
 }
 
-static __always_inline int dsa_execute(void *wq_portal, int dedicated, 
+static __always_inline int dsa_execute(struct memproxy_wq *wq, 
 	struct dsa_hw_desc *hw, volatile uint8_t* comp)
 {
 	//printf("desc flags: 0x%x, opcode: 0x%x, dedicated: %d\n", hw->flags, hw->opcode, dedicated);
 	for (int r = 0; r < ENQCMD_MAX_RETRIES; ++r) {
 		int retry = 0;
 		*comp = 0;
-		if (dedicated) {
-			int old_outstanding = dwq_desc_outstanding;
-			 if (old_outstanding < wq_size &&
+		if (wq->dedicated) {
+			int old_outstanding = wq->dwq_desc_outstanding;
+			 if (old_outstanding < wq->wq_size &&
 					atomic_compare_exchange_strong(
-					&dwq_desc_outstanding, &old_outstanding,
+					&wq->dwq_desc_outstanding, &old_outstanding,
 					old_outstanding+1))
-				movdir64b(hw, wq_portal);
+				movdir64b(hw, wq->wq_portal);
 			else {
 				retry = 1;
 			}
 		} else {
-			retry = enqcmd(hw, wq_portal);
+			retry = enqcmd(hw, wq->wq_portal);
 		}
 		if (!retry) {
 			if (wait_method == WAIT_YIELD)
@@ -247,8 +255,8 @@ static __always_inline int dsa_execute(void *wq_portal, int dedicated,
 			else
 				dsa_wait_busy_poll(comp);
 
-			if (dedicated)
-				atomic_store(&dwq_desc_outstanding, dwq_desc_outstanding - 1);
+			if (wq->dedicated)
+				atomic_store(&wq->dwq_desc_outstanding, wq->dwq_desc_outstanding - 1);
 			if (*comp == DSA_COMP_SUCCESS)
 				return SUCCESS;
 			else if ((*comp & 0x7F) == DSA_COMP_PAGE_FAULT_NOBOF)
@@ -350,10 +358,11 @@ void memproxy_init(void)
         unsigned int unused[2];
         unsigned int leaf, waitpkg;
 	int dev_id = -1, shared = 1;
-
+	int used_devids[MAX_WQS];
         struct accfg_device *device;
         struct accfg_wq *wq;
         int rc;
+	int i;
 
         /* detect umwait support */
         leaf = 7;
@@ -365,11 +374,15 @@ void memproxy_init(void)
         }
 
 	memproxy_ctx = NULL;
-	memproxy_wq = NULL;
+	for (i = 0; i < MAX_WQS; i++) {
+		wqs[i].acc_wq = NULL;
+		used_devids[i] = -1;
+	}
 
 	rc = accfg_new(&memproxy_ctx);
 	if (rc < 0)
 		return;
+	num_wqs = 0;
 
 again:
         accfg_device_foreach(memproxy_ctx, device) {
@@ -384,6 +397,13 @@ again:
                 if (accfg_device_get_id(device) != dev_id &&
                     dev_id != -1)
                         continue;
+
+		/* Check if we have already used a wq on this device */
+		for (i = 0; i < MAX_WQS; i++)
+			if (accfg_device_get_id(device) == used_devids[i])
+				break;
+		if (i != MAX_WQS)
+			continue;
 
                 accfg_wq_foreach(device, wq) {
                         enum accfg_wq_state wstate;
@@ -407,54 +427,66 @@ again:
                                 continue;
 
 			if (mode == ACCFG_WQ_SHARED)
-				wq_dedicated = false;
+				wqs[num_wqs].dedicated = false;
 			else
-				wq_dedicated = true;
+				wqs[num_wqs].dedicated = true;
 
-			wq_size = accfg_wq_get_size(wq);
+			wqs[num_wqs].wq_size = accfg_wq_get_size(wq);
 
-                        memproxy_wq = wq;
+                        wqs[num_wqs].acc_wq = wq;
+			wqs[num_wqs].dsa_gencap = accfg_device_get_gen_cap(device);
+
+			used_devids[num_wqs] = accfg_device_get_id(device);
+
+			num_wqs++;
 			break;
                 }
-		if (memproxy_wq) {
-			dsa_gencap = accfg_device_get_gen_cap(device);
+		if (num_wqs == MAX_WQS)
 			break;
-		}
         }
 
 	// If we can't find an SWQ, try to find a DWQ
-	if (memproxy_wq == NULL && shared == 1) {
+	if (num_wqs < MAX_WQS && shared == 1) {
 		shared = 0;
 		goto again;
 	}
 
-       if (memproxy_wq == NULL)
+       if (num_wqs == 0)
 	      goto fail;
 
-        rc = accfg_wq_get_user_dev_path(memproxy_wq, wq_path, PATH_MAX);
-        if (rc) {
-                printf("Error getting device path\n");
-                goto fail;
-        }
+       for (i = 0; i < num_wqs; i++) {
+	       struct accfg_wq *acc_wq = wqs[i].acc_wq;
 
-	// open DSA WQ
-	wq_fd = open(wq_path, O_RDWR);
-	if (wq_fd < 0) {
-		printf("DSA WQ %s open error: %s\n", wq_path, strerror(errno));
-		goto fail;
-	}
+		rc = accfg_wq_get_user_dev_path(acc_wq, wqs[i].wq_path, PATH_MAX);
+		if (rc) {
+			printf("Error getting device path\n");
+			goto fail_wq;
+		}
 
-	// map DSA WQ portal
-	wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wq_fd, 0);
-	if (wq_portal == NULL) {
-		printf("mmap error for DSA wq: %s, error: %s\n", wq_path, strerror(errno));
-		close(wq_fd);
-		goto fail;
-	}
+		// open DSA WQ
+		wqs[i].wq_fd = open(wqs[i].wq_path, O_RDWR);
+		if (wqs[i].wq_fd < 0) {
+			printf("DSA WQ %s open error: %s\n", wqs[i].wq_path, strerror(errno));
+			goto fail_wq;
+		}
+
+		// map DSA WQ portal
+		wqs[i].wq_portal = mmap(NULL, 0x1000, PROT_WRITE, MAP_SHARED | MAP_POPULATE, wqs[i].wq_fd, 0);
+		if (wqs[i].wq_portal == NULL) {
+			printf("mmap error for DSA wq: %s, error: %s\n", wqs[i].wq_path, strerror(errno));
+			close(wqs[i].wq_fd);
+			goto fail_wq;
+		}
+       }
 	printf("*** initialized dsa ***\n");
 
         return;
 
+fail_wq:
+	for (int j = 0; j < i; j++) {
+		munmap(wqs[j].wq_portal, 0x1000);
+		close(wqs[j].wq_fd);
+	}
 fail:
 	accfg_unref(memproxy_ctx);
 	memproxy_ctx = NULL;
@@ -501,9 +533,11 @@ static void init_mem_proxy(void)
 			if (dsa_min_size_str != NULL) 
 				dsa_min_size = atoi(dsa_min_size_str);
 
-			printf("wq_dedicated: %d, wq_size: %d, dsa_cap: %lx, collect_stats: %d, "
-				"use_std_lib_calls: %d, dsa_min_size: %d, wq_path: %s, wait_method %s\n",
-			wq_dedicated, wq_size, dsa_gencap, collect_stats, use_std_lib_calls, dsa_min_size, wq_path, wait_names[wait_method]);
+			for (int i = 0; i < num_wqs; i++)
+				printf("[%d] wq_path: %s, dedicated: %d, wq_size: %d, dsa_cap: %lx\n", i, 
+					wqs[i].wq_path, wqs[i].dedicated, wqs[i].wq_size, wqs[i].dsa_gencap);
+			printf("collect_stats: %d, use_std_lib_calls: %d, dsa_min_size: %d, wait_method %s\n",
+				collect_stats, use_std_lib_calls, dsa_min_size, wait_names[wait_method]);
 		}
 	}
 }
@@ -511,52 +545,69 @@ static void init_mem_proxy(void)
 static void cleanup_mem_proxy(void)
 {
 	// unmap and close wq portal
-	if (wq_portal != NULL) {
-		munmap(wq_portal, 0x1000);
-		close(wq_fd);
+	for (int i = 0; i < num_wqs; i++) {
+		if (wqs[i].wq_portal != NULL) {
+			munmap(wqs[i].wq_portal, 0x1000);
+			close(wqs[i].wq_fd);
+		}
 	}
 	print_stats();
+}
+
+static struct memproxy_wq *get_wq(void)
+{
+	/* No need to have strict round robin wq usage
+	 * in order to avoid using locked instructions */
+	int wq_idx = next_wq++ % num_wqs;
+
+	return &wqs[wq_idx];
 }
 
 static void *dsa_memset(void *s, int c, size_t n, int *result)
 {
 	// memset pattern size is always bytes
 	uint64_t memset_pattern;
+	struct memproxy_wq *wq = get_wq();
+
 	for (int i=0; i < 8; ++i)
 		((uint8_t *) &memset_pattern)[i] = (uint8_t) c;
 
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_MEMFILL;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (dsa_gencap & GENCAP_CC_MEMORY)
+	if (wq->dsa_gencap & GENCAP_CC_MEMORY)
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr =	(uint64_t) &thr_comp;
 	thr_desc.pattern = memset_pattern;
 	thr_desc.dst_addr = (uint64_t) s;
 	thr_desc.xfer_size = (uint32_t) n;
 
-	*result = dsa_execute(wq_portal, wq_dedicated, &thr_desc, &thr_comp.status);
+	*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
 	return s;
 }
 
 static void *dsa_memcpymove(void *dest, const void *src, size_t n, bool is_memcpy, int *result)
 {
+	struct memproxy_wq *wq = get_wq();
+
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_MEMMOVE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
-	if (dsa_gencap & GENCAP_CC_MEMORY)
+	if (wq->dsa_gencap & GENCAP_CC_MEMORY)
 		thr_desc.flags |= IDXD_OP_FLAG_CC;
 	thr_desc.completion_addr =	(uint64_t) &thr_comp;
 	thr_desc.src_addr = (uint64_t) src;
 	thr_desc.dst_addr = (uint64_t) dest;
 	thr_desc.xfer_size = (uint32_t) n;
 
-	*result = dsa_execute(wq_portal, wq_dedicated, &thr_desc, &thr_comp.status);
+	*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
 	return dest;
 }
 
 static int dsa_memcmp(const void *s1, const void *s2, size_t n, int *result)
 {
+	struct memproxy_wq *wq = get_wq();
+
 	// prepare memfill descriptor
 	thr_desc.opcode = DSA_OPCODE_COMPARE;
 	thr_desc.flags = IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR;
@@ -565,13 +616,13 @@ static int dsa_memcmp(const void *s1, const void *s2, size_t n, int *result)
 	thr_desc.src2_addr = (uint64_t) s2;
 	thr_desc.xfer_size = (uint32_t) n;
 
-	*result = dsa_execute(wq_portal, wq_dedicated, &thr_desc, &thr_comp.status);
+	*result = dsa_execute(wq, &thr_desc, &thr_comp.status);
 	return thr_comp.result;
 }
 
 static void *mem_op_internal(int op, void *s1, const void *s2, size_t n, int c)
 {
-	int result = 0; /* 0 is success */
+	int result = 0;
 	void *ret = NULL;
 	int use_orig_func = USE_ORIG_FUNC(n);
 	struct timespec st, et;
@@ -614,7 +665,7 @@ static void *mem_op_internal(int op, void *s1, const void *s2, size_t n, int c)
 
 	if (use_orig_func) {
 		if (collect_stats)
-			clock_gettime(CLOCK_REALTIME, &st);
+			clock_gettime(CLOCK_BOOTTIME, &st);
 		switch (op) {
 			case MEMSET: 
 				ret = orig_memset(s1, c, n);
@@ -630,7 +681,7 @@ static void *mem_op_internal(int op, void *s1, const void *s2, size_t n, int c)
 				break;
 		}
 		if (collect_stats)
-			clock_gettime(CLOCK_REALTIME, &et);
+			clock_gettime(CLOCK_BOOTTIME, &et);
 		update_stats(op, n, collect_stats ? TS_NS(st, et) : 0, STDC_CALL, 0);
 	}
 
