@@ -512,6 +512,10 @@ static void init_mem_proxy(void)
 		if (env_str != NULL)
 			collect_stats = atoi(env_str);
 
+		env_str = getenv("DSA_MIN_SIZE");
+		if (env_str != NULL)
+			dsa_min_size = atoi(env_str);
+
 		env_str = getenv("WAIT_METHOD");
 		if (env_str != NULL) {
 			if (!strncmp(env_str, "yield", 5))
