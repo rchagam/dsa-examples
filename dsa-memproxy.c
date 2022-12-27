@@ -131,6 +131,7 @@ int wait_method = WAIT_BUSYPOLL;
 
 int collect_stats = 1;
 atomic_int op_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
+atomic_ullong bytes_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP];
 atomic_ullong lat_counter[HIST_NO_BUCKETS][MAX_STAT_GROUP][MAX_MEMOP];
 atomic_int fail_counter[HIST_NO_BUCKETS][MAX_FAILURES];
 
@@ -278,6 +279,7 @@ static void update_stats(int op, size_t n, uint64_t elapsed_ns, int group, int e
 	if (bucket >= HIST_NO_BUCKETS)  /* last bucket includes remaining sizes */
 		bucket = HIST_NO_BUCKETS-1;
 	++op_counter[bucket][group][op];
+	bytes_counter[bucket][group] += n;
 	lat_counter[bucket][group][op] += elapsed_ns;
 	if (group == DSA_CALL_FAILED)
 		++fail_counter[bucket][error_code];
@@ -297,13 +299,17 @@ static void print_stats()
 			
 		printf("%17s    ", "");
 		for (int g = 0; g < MAX_STAT_GROUP; ++g)
-			printf("<***** %-13s *****> ", stat_group_names[g]);
+			if (g == DSA_FAIL_CODES)
+				printf("<***** %-13s *****> ", stat_group_names[g]);
+			else
+				printf("<*************** %-13s ***************> ", stat_group_names[g]);
 		printf("\n");
 
 		printf("%-17s -- ", "Byte Range");
 		for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 			for (int o = 0; o < MAX_MEMOP; ++o)
-				printf("%-6s ", memop_names[o]);
+				printf("%-8s ", memop_names[o]);
+			printf("%-12s ", "bytes");
 		}
 		if (t == 0)
 			for (int o = 1; o < MAX_FAILURES; ++o)
@@ -331,7 +337,7 @@ static void print_stats()
 				for (int g = 0; g < MAX_STAT_GROUP - 1; ++g) {
 					for (int o = 0; o < MAX_MEMOP; ++o) {
 						if (t == 0) {
-							printf("%-6d ", op_counter[b][g][o]);
+							printf("%-8d ", op_counter[b][g][o]);
 						}
 						else {
 							if (op_counter[b][g][o] != 0) {
@@ -343,6 +349,8 @@ static void print_stats()
 							}
 						}
 					}
+					if (t == 0)
+						printf("%-12ld ", bytes_counter[b][g]);
 				}
 				if (t == 0)
 					for (int o = 1; o < MAX_FAILURES; ++o)
