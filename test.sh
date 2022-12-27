@@ -1,22 +1,26 @@
 #!/bin/bash
-DSA_PERF_MICROS_DIR=/home/reddy/gitrepos/dsa-perf-micros
-DSA_WQTYPE="s"
-WQ_NAME=wq0.0
+DSA_PROXY_LIB_DIR=/home/skuma24/dsa-examples
 
-if [[ "$1" == "d" ]]; then
-	echo "************ Running Dedicated WQ Testing using $WQ_NAME  ***********"
-	DSA_WQTYPE="d"
-	export WQ_DEDICATED=1
-else
-	echo "************ Running Shared WQ Testing using $WQ_NAME  ***********"
-	DSA_WQTYPE="s"
-	export WQ_DEDICATED=0
-fi
+accel-config disable-device dsa0
+accel-config disable-device dsa2
+accel-config disable-device dsa4
+accel-config disable-device dsa6
 
-$DSA_PERF_MICROS_DIR/scripts/setup_dsa.sh -d dsa0
-$DSA_PERF_MICROS_DIR/scripts/setup_dsa.sh -d dsa0 -w 1 -m $DSA_WQTYPE  -e 1
-export LD_PRELOAD=./dsa-memproxy.so
-export WQ_PATH="/dev/dsa/${WQ_NAME}"
+accel-config load-config -c $DSA_PROXY_LIB_DIR/memproxy-4-dsa.conf
+
+accel-config enable-device dsa0
+accel-config enable-device dsa2
+accel-config enable-device dsa4
+accel-config enable-device dsa6
+
+accel-config enable-wq dsa0/wq0.0
+accel-config enable-wq dsa2/wq2.0
+accel-config enable-wq dsa4/wq4.0
+accel-config enable-wq dsa6/wq6.0
+
 export USESTDC_CALLS=0
 export COLLECT_STATS=1
-dsa-memproxy-test
+export WAIT_METHOD=yield
+export DSA_MIN_BYTES=8192
+#perf stat -e dsa0/event=0x1,event_category=0x0/,dsa2/event=0x1,event_category=0x0/,dsa4/event=0x1,event_category=0x0/,dsa6/event=0x1,event_category=0x0/ numactl -C 4,5 time ./dsa-memproxy-test
+./dsa-memproxy-test
