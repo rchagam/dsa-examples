@@ -9,7 +9,7 @@ dsa-sample-mt: dsa-sample-mt.c
 	gcc dsa-sample-mt.c $(DML_LIB_CXX) libdsaproxy.so.1.0 -lpthread -laccel-config -ldl -o dsa-sample-mt
 
 dsa-memproxy-test: dsa-memproxy-test.c
-	gcc dsa-memproxy-test.c $(DML_LIB_CXX) -o dsa-memproxy-test libdsaproxy.so.1.0 -laccel-config -lpthread -ldl
+	gcc dsa-memproxy-test.c $(DML_LIB_CXX) -o dsa-memproxy-test -ldsaproxy -laccel-config -lpthread -ldl
 
 libdsaproxy: dsa-memproxy.c
 	gcc -shared -fPIC -Wl,-soname,libdsaproxy.so dsa-memproxy.c $(DML_LIB_CXX) -o libdsaproxy.so.1.0 -ldl
